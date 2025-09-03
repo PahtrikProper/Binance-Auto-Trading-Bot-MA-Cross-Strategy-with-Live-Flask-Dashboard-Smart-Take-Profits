@@ -1,4 +1,4 @@
-HOW ONTO THIS. from flask import Flask, request
+from flask import Flask, request
 import threading, requests, json, time, math, hmac, hashlib, traceback
 from urllib.parse import urlencode
 import websocket
@@ -9,8 +9,8 @@ app = Flask(__name__)
 # --- Binance/API/Pair ---
 SYMBOL = "SOLUSDT"
 INTERVAL = "3m"
-API_KEY = "INSERT YOUR BINANCE API KEY HERE"
-API_SECRET = "INSERT YOUR API SECRET HERE"
+API_KEY = "QGS9KHYCNW6TiZURcUKIjWGInGB2BUaugxM6ySCl2DM8kT1vLBqMc9PWhDxxLcjd"
+API_SECRET = "xxznBBjRuJ1l9NG27ZyjmxZzWqLjsQCN2RvNdpatnrTSYMR9bobWYyDbB6zGvVnQ"
 
 # --- Strategy/Trading Parameters ---
 FEE_RATE_TRADE = 0.001
@@ -20,11 +20,11 @@ TP_ARM_BUFFER = 0.10
 TP_EXIT_BUFFER = 0.01
 MIN_BUY_CONFIRM_TICKS = 1
 SELL_CONFIRM_TICKS = 1
-TICK_THROTTLE_SECS = 5
+TICK_THROTTLE_SECS = 10
 
 # --- MA Parameters ---
 MIN_FAST_LEN = 2
-MAX_SLOW_LEN = 68
+MAX_SLOW_LEN = 168
 
 # --- Backtest/Chart ---
 BACKTEST_HOURS = 24
