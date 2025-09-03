@@ -9,8 +9,8 @@ app = Flask(__name__)
 # --- Binance/API/Pair ---
 SYMBOL = "SOLUSDT"
 INTERVAL = "3m"
-API_KEY = "QGS9KHYCNW6TiZURcUKIjWGInGB2BUaugxM6ySCl2DM8kT1vLBqMc9PWhDxxLcjd"
-API_SECRET = "xxznBBjRuJ1l9NG27ZyjmxZzWqLjsQCN2RvNdpatnrTSYMR9bobWYyDbB6zGvVnQ"
+API_KEY = "INSERT BINANCE KEY HERE"
+API_SECRET = "INSERT BINANCE SECRET HERE"
 
 # --- Strategy/Trading Parameters ---
 FEE_RATE_TRADE = 0.001
