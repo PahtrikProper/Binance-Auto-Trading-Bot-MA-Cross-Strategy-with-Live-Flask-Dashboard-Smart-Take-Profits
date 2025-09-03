@@ -9,8 +9,8 @@ app = Flask(__name__)
 # --- Binance/API/Pair ---
 SYMBOL = "SOLUSDT"
 INTERVAL = "3m"
-API_KEY = "INSERT BINANCE KEY HERE"
-API_SECRET = "INSERT BINANCE SECRET HERE"
+API_KEY = "insert your binance key here"
+API_SECRET = "insert your secret binance key here"
 
 # --- Strategy/Trading Parameters ---
 FEE_RATE_TRADE = 0.001
@@ -23,11 +23,11 @@ SELL_CONFIRM_TICKS = 1
 TICK_THROTTLE_SECS = 10
 
 # --- MA Parameters ---
-MIN_FAST_LEN = 2
+MIN_FAST_LEN = 11
 MAX_SLOW_LEN = 168
 
 # --- Backtest/Chart ---
-BACKTEST_HOURS = 24
+BACKTEST_HOURS = 17
 CHART_HIST_LIMIT = 200
 WS_RECONNECT_SECS = 10
 
@@ -367,6 +367,9 @@ class TickStrategy(threading.Thread):
                     "shape": "arrowUp",
                     "text": f"BUY {price:.4f}"
                 })
+                # --- LIVE MARKER PATCH ---
+                if len(self.markers) > CHART_HIST_LIMIT:
+                    self.markers = self.markers[-CHART_HIST_LIMIT:]
             else:
                 print(f"[TICK STRATEGY] BUY skipped (qty/filters)", flush=True)
             self.buy_in_progress = False
@@ -397,11 +400,15 @@ class TickStrategy(threading.Thread):
                     "shape": "arrowDown",
                     "text": f"SELL {price:.4f}"
                 })
+                # --- LIVE MARKER PATCH ---
+                if len(self.markers) > CHART_HIST_LIMIT:
+                    self.markers = self.markers[-CHART_HIST_LIMIT:]
             else:
                 print(f"[TICK STRATEGY] SELL skipped (qty/filters)", flush=True)
         except Exception as e:
             print(f"[TICK STRATEGY] SELL EXCEPTION: {e}", flush=True)
             traceback.print_exc()
+
 def backtest_for_lengths(prices, times, fast_len, slow_len):
     n = len(prices)
     if n < slow_len + 2:
@@ -562,8 +569,24 @@ def index():
       slowSeries.setData(slowMAData);
     }}
     priceSeries.setData(priceData);
-    priceSeries.setMarkers(markers); // update markers live
+    // --- LIVE MARKER PATCH: markers now update live via polling, not here!
   }};
+  // --- LIVE MARKER PATCH START ---
+  let lastMarkerCount = 0;
+  function pollMarkers() {{
+      fetch('/markers')
+        .then(r => r.json())
+        .then(data => {{
+          if (data.markers && data.markers.length !== lastMarkerCount) {{
+            priceSeries.setMarkers(data.markers);
+            lastMarkerCount = data.markers.length;
+          }}
+        }})
+        .catch(() => {{}});
+      setTimeout(pollMarkers, 3000);
+  }}
+  pollMarkers();
+  // --- LIVE MARKER PATCH END ---
   window.runBacktest = function() {{
     document.getElementById('bt').innerText = 'Running...';
     fetch('/backtest').then(r => r.json()).then(bt => {{
@@ -608,6 +631,11 @@ def seed():
         "slowMAData": slowMAData,
         "markers": markers,
     })
+
+@app.route("/markers")  # --- LIVE MARKER PATCH ---
+def markers_api():
+    markers = getattr(globals().get("strat_thread", None), "markers", [])
+    return json.dumps({"markers": markers})
 
 @app.route("/backtest")
 def backtest_api():
