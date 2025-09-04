@@ -1,87 +1,64 @@
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-import threading, time, random, pandas as pd, numpy as np, ccxt, sqlite3, os
+import threading, requests, json, time, math, hmac, hashlib, traceback, os
+from urllib.parse import urlencode
+import websocket
 
-app = Flask(__name__)
-
-# === USER CONFIG ===
-SYMBOL = 'SOL/USDT'
-TIMEFRAME = '15m'
-DATA_LIMIT = 500
-TRADE_SIZE = 0.05
-
-API_KEY = "insert binance api key here"
-API_SECRET = "insert binance secret key here"
-
-# --- ENTRY/EXIT MA RANGES ---
-BUY_FAST_RANGE = (2, 40)
-BUY_SLOW_RANGE = (150, 350)
-SELL_FAST_RANGE = (2, 25)
-SELL_MID_RANGE = (26, 70)
-SELL_SLOW_RANGE = (71, 250)
-
-# --- Default MA values ---
-BUY_MA1_LEN = 2
-BUY_MA2_LEN = 14
-SELL_MA1_LEN = 6
-SELL_MA2_LEN = 22
-SELL_MA3_LEN = 100
-
-MAX_TESTS = 10000
-SELL_CROSS_CONFIRM_TICKS = 2
-
-# --- TP Strategy ---
+# ======================= USER CONFIGURATION ========================
+SYMBOL = "ADAUSDT"
+INTERVAL = "3m"
+API_KEY = "insert your binance api key here"
+API_SECRET = "insert the api secret key here"
+FEE_RATE_TRADE = 0.001
+SLIPPAGE_PCT = 0.05
 TP_LEVELS = [0.70, 0.40, 0.22]
 TP_ARM_BUFFER = 0.10
 TP_EXIT_BUFFER = 0.01
+MIN_BUY_CONFIRM_TICKS = 1
+SELL_CONFIRM_TICKS = 3
+TICK_THROTTLE_SECS = 15
 
-# === LOCAL SQLITE DATABASE ===
-DB_FILE = "backtest.db"
-if os.path.exists(DB_FILE):
-    os.remove(DB_FILE)
+MIN_FAST_LEN = 2
+MAX_SLOW_LEN = 200
 
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE trades (
-    id INTEGER PRIMARY KEY,
-    entry_time TEXT,
-    entry REAL,
-    exit_time TEXT,
-    exit REAL,
-    profit REAL
-)
-""")
-c.execute("""
-CREATE TABLE markers (
-    id INTEGER PRIMARY KEY,
-    time INTEGER,
-    position TEXT,
-    color TEXT,
-    shape TEXT,
-    text TEXT
-)
-""")
-conn.commit()
+BACKTEST_HOURS = 24
+CHART_HIST_LIMIT = 2000
+WS_RECONNECT_SECS = 10
 
-# === STATE ===
+BASE_URL = "https://api.binance.com"
+PUBLIC_TIMEOUT = 20
+SIGNED_TIMEOUT = 20
+
+INTERVAL_TO_SECONDS = {
+    "1s": 1, "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200,
+    "1d": 86400, "3d": 259200, "1w": 604800, "1M": 2592000
+}
+CANDLE_SECONDS = INTERVAL_TO_SECONDS.get(INTERVAL, 180)
+INTERVAL_MS = CANDLE_SECONDS * 1000
+
+BASE_ASSET = SYMBOL[:-4] if SYMBOL.endswith("USDT") else SYMBOL.split("USDT")[0]
+QUOTE_ASSET = "USDT"
+
+# ========== STATE & LOGGING ==========
 state = {
-    "backtest_running": False,
-    "backtest_progress": 0,
-    "backtest_total": 0,
-    "backtest_log": [],
-    "best_result": None,
-    "ema_settings": None,
     "live_running": False,
-    "live_log": [],
     "stop_signal": False,
+    "live_log": [],
+    "last_trade": None,
+    "best_params": None,
+    "backtest_metrics": None,
+    "markers": [],
+    "trades": [],
 }
 
-# === HTML DASHBOARD ===
+app = Flask(__name__)
+
+# ========== MODERN HTML DASHBOARD ==========
 HTML = """
 <!doctype html>
 <html>
 <head>
-    <title>EMA Cross Web Dashboard</title>
+    <title>{{ symbol }} EMA Tick Trader</title>
     <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
       body { background: #16181c; color: #e5e7eb; font-family: Arial,sans-serif; margin:0;}
@@ -91,49 +68,44 @@ HTML = """
       .status { font-weight: bold; }
       .row { display: flex; gap: 40px; }
       .col { flex:1;}
-      button, input[type=number] { font-size:1.1em; border-radius:7px; border:1px solid #333;}
+      button, input[type=number] { font-size:1.1em; border-radius:7px; border:1px ADAid #333;}
       button { background:#45caff; color:#131313; padding: 8px 20px;}
       button:disabled { background:#5c7087; color:#ddd;}
-      pre { font-size:1em; background: #232838; color:#89e2ff; border-radius:8px; padding:7px 13px;}
+      pre { font-size:1em; background: #232838; color: #89e2ff; border-radius:8px; padding:7px 13px;}
       .logs { background:#181b24; color:#bbf7d0; max-height:180px; overflow:auto; border-radius:7px; margin-bottom: 8px;}
       .statbox { background: #13181f; border-radius:8px; padding:7px 11px; margin:7px 0; font-size:1.05em;}
       .chart-wrap { background: #13181f; border-radius:12px; padding:8px; margin-bottom:18px;}
     </style>
     <script>
-    let chart, priceSeries, emaSeries=[];
+    let chart, priceSeries, fastSeries, slowSeries;
     function initChart() {
       chart = LightweightCharts.createChart(document.getElementById('chart'), {
         width: 1040, height: 420,
         layout: { background: { color: '#1b1e25' }, textColor: '#e5e7eb' },
         grid: { vertLines: { color: '#23293a' }, horzLines: { color: '#23293a' } },
         rightPriceScale: { borderColor: '#2b3245' },
-        timeScale: { borderColor: '#2b3245', timeVisible:true, secondsVisible:false }
+        timeScale: { borderColor: '#2b3245', timeVisible:true, secondsVisible:true }
       });
       priceSeries = chart.addLineSeries({ color:'deepskyblue', lineWidth:2 });
-      emaSeries = [
-        chart.addLineSeries({ color:'lime', lineWidth:2 }),      // Buy Fast
-        chart.addLineSeries({ color:'orange', lineWidth:2 }),    // Buy Slow
-        chart.addLineSeries({ color:'#ff1aff', lineWidth:2 }),   // Sell Fast
-        chart.addLineSeries({ color:'#f4d35e', lineWidth:2 }),   // Sell Mid
-        chart.addLineSeries({ color:'#95ffce', lineWidth:2 }),   // Sell Slow
-      ];
+      fastSeries = chart.addLineSeries({ color:'orange', lineWidth:2 });
+      slowSeries = chart.addLineSeries({ color:'yellow', lineWidth:2 });
     }
     function updateChart() {
       fetch('/chartdata').then(r=>r.json()).then(d=>{
         priceSeries.setData(d.prices);
-        for(let i=0;i<5;++i) emaSeries[i].setData(d.emas[i]);
+        fastSeries.setData(d.fast);
+        slowSeries.setData(d.slow);
         priceSeries.setMarkers(d.markers);
       });
     }
     function poll() {
       fetch('/status').then(r=>r.json()).then(d=>{
-        document.getElementById('backtest_status').innerHTML = d.backtest_status;
-        document.getElementById('backtest_log').innerText = d.backtest_log.join('\\n');
         document.getElementById('live_status').innerHTML = d.live_status;
         document.getElementById('live_log').innerText = d.live_log.join('\\n');
-        document.getElementById('ema_settings').innerHTML = d.ema_settings;
         document.getElementById('best_result').innerHTML = d.best_result;
+        document.getElementById('ema_settings').innerHTML = d.ema_settings;
         document.getElementById('trades').innerHTML = d.trades;
+        document.getElementById('backtest_metrics').innerHTML = d.backtest_metrics;
       });
       updateChart();
       setTimeout(poll, 4000);
@@ -143,7 +115,7 @@ HTML = """
 </head>
 <body>
 <div class="container">
-  <h1>EMA Cross Web Dashboard</h1>
+  <h1>{{ symbol }} Tick EMA Dashboard</h1>
   <div class="chart-wrap">
     <div id="chart" style="width:1040px; height:420px;"></div>
   </div>
@@ -151,12 +123,10 @@ HTML = """
     <div class="col">
       <h2>Backtest</h2>
       <form method="post" action="/start_backtest">
-        <label>Max tests: <input type="number" name="num_tests" value="60" min="1" max="10000" style="width:80px;" {% if backtest_running %}disabled{% endif %}></label>
-        <button type="submit" {% if backtest_running %}disabled{% endif %}>Start Backtest</button>
+        <button type="submit">Start Backtest</button>
       </form>
-      <div class="status" id="backtest_status"></div>
-      <pre class="logs" id="backtest_log"></pre>
       <div class="statbox" id="best_result"></div>
+      <div class="statbox" id="backtest_metrics"></div>
     </div>
     <div class="col">
       <h2>Live Trading</h2>
@@ -166,7 +136,7 @@ HTML = """
       <pre class="logs" id="live_log"></pre>
     </div>
     <div class="col">
-      <h2>Best MAs</h2>
+      <h2>Best Params</h2>
       <div class="statbox" id="ema_settings"></div>
       <h2>Last Trades</h2>
       <div id="trades" class="logs"></div>
@@ -176,411 +146,535 @@ HTML = """
 </body>
 </html>
 """
-# === CORE HELPERS ===
-def fetch_ohlcv(symbol, tf, limit, exchange):
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv(symbol, tf, limit=limit),
-        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    )
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
+# ====================== BINANCE & STRATEGY HELPERS ======================
+def public_get(path, params=None):
+    r = requests.get(BASE_URL + path, params=params, timeout=PUBLIC_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def signed_headers():
+    if not API_KEY: raise RuntimeError("BINANCE_API_KEY not set")
+    return {"X-MBX-APIKEY": API_KEY}
 
-# ================= BACKTEST (Memory-Safe, SQLite SAFE) =================
-def backtest(
-    df, 
-    buy_fast=BUY_MA1_LEN, buy_slow=BUY_MA2_LEN,
-    sell_fast=SELL_MA1_LEN, sell_mid=SELL_MA2_LEN, sell_slow=SELL_MA3_LEN,
-    plot_markers=False  # NEW PARAMETER
-):
-    slowest = max(buy_fast, buy_slow, sell_fast, sell_mid, sell_slow)
-    if len(df) < slowest + 10:
-        return {
-            'buy_fast': buy_fast, 'buy_slow': buy_slow,
-            'sell_fast': sell_fast, 'sell_mid': sell_mid, 'sell_slow': sell_slow,
-            'total_profit': 0,
-            'num_trades': 0,
-            'win_rate': 0
-        }
+def signed_request(method, path, params=None):
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Missing API keys")
+    if params is None: params = {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    query = urlencode(params, doseq=True)
+    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = signature
+    url = BASE_URL + path
+    if method == "GET":
+        r = requests.get(url, headers=signed_headers(), params=params, timeout=SIGNED_TIMEOUT)
+    elif method == "POST":
+        r = requests.post(url, headers=signed_headers(), params=params, timeout=SIGNED_TIMEOUT)
+    else:
+        raise ValueError("Unsupported method")
+    r.raise_for_status()
+    return r.json()
 
-    alpha_bf = 2 / (buy_fast + 1)
-    alpha_bs = 2 / (buy_slow + 1)
-    alpha_sf = 2 / (sell_fast + 1)
-    alpha_sm = 2 / (sell_mid + 1)
-    alpha_ss = 2 / (sell_slow + 1)
+def fetch_klines_recent(symbol, interval, limit=CHART_HIST_LIMIT):
+    return public_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
-    ema_bf = df['close'].iloc[0]
-    ema_bs = df['close'].iloc[0]
-    ema_sf = df['close'].iloc[0]
-    ema_sm = df['close'].iloc[0]
-    ema_ss = df['close'].iloc[0]
+def to_price_time(candles):
+    prices, times = [], []
+    for c in candles:
+        times.append(c[0] // 1000)
+        prices.append(float(c[4]))
+    return prices, times
 
-    in_trade = False
-    entry_price = None
+def prefix_sums(arr):
+    ps, s = [0.0]*len(arr), 0.0
+    for i, v in enumerate(arr):
+        s += v
+        ps[i] = s
+    return ps
+
+def mean_at(ps, i, win):
+    if win == 0: return 0.0
+    j = i - win
+    total = ps[i] if j < 0 else ps[i] - ps[j]
+    return total / win
+
+def calc_ma_series(prices, window):
+    if len(prices) < window or window == 0: return [None]*len(prices)
+    ps = prefix_sums(prices)
+    out = [None]*(window-1)
+    for i in range(window-1, len(prices)):
+        out.append(mean_at(ps, i, window))
+    return out
+
+# --- Binance Symbol Filters & Balance Helpers ---
+_filters_cache = None
+def get_symbol_filters(symbol):
+    global _filters_cache
+    if _filters_cache is None:
+        info = public_get("/api/v3/exchangeInfo")
+        _filters_cache = {s["symbol"]: s for s in info.get("symbols", [])}
+    s = _filters_cache.get(symbol)
+    if not s:
+        raise RuntimeError(f"Symbol {symbol} not found in exchangeInfo")
+    lot = next((f for f in s["filters"] if f["filterType"] == "LOT_SIZE"), None)
+    notional = next((f for f in s["filters"] if f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL")), None)
+    step_size = float(lot["stepSize"]) if lot else 0.000001
+    min_qty = float(lot["minQty"]) if lot else 0.0
+    min_notional = float(notional["minNotional"]) if notional and "minNotional" in notional else 0.0
+    step_str = f"{step_size:.16f}".rstrip("0")
+    qty_precision = len(step_str.split(".")[1]) if "." in step_str else 0
+    return step_size, min_qty, min_notional, qty_precision
+
+def get_balances():
+    acct = signed_request("GET", "/api/v3/account")
+    bals = {b["asset"]: (float(b["free"]), float(b["locked"])) for b in acct["balances"]}
+    base_free = bals.get(BASE_ASSET, (0.0, 0.0))[0]
+    quote_free = bals.get(QUOTE_ASSET, (0.0, 0.0))[0]
+    return base_free, quote_free
+
+def buy(quote_balance, price, fee, step_size, min_qty, min_notional, qty_precision):
+    raw_qty = quote_balance / (price * (1 + fee))
+    qty = math.floor(raw_qty / step_size) * step_size
+    qty = math.floor(qty * (10 ** qty_precision)) / (10 ** qty_precision)
+    notional = qty * price
+    if qty < min_qty or notional < min_notional:
+        state['live_log'].append(f"[Buy] Skipped: qty={qty:.5f} notional={notional:.3f} (min_qty={min_qty}, min_notional={min_notional})")
+        return None
+    try:
+        res = signed_request("POST", "/api/v3/order",
+                             {"symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": f"{qty:.{qty_precision}f}"})
+        state['live_log'].append(f"[Buy] Market order placed: qty={qty:.4f} @ {price:.4f}")
+        return qty
+    except Exception as e:
+        state['live_log'].append(f"[Buy] Order failed: {e}")
+        return None
+
+def sell(base_balance, price, step_size, min_qty, min_notional, qty_precision):
+    qty = math.floor(base_balance / step_size) * step_size
+    qty = math.floor(qty * (10 ** qty_precision)) / (10 ** qty_precision)
+    notional = qty * price
+    if qty < min_qty or notional < min_notional:
+        state['live_log'].append(f"[Sell] Skipped: qty={qty:.5f} notional={notional:.3f} (min_qty={min_qty}, min_notional={min_notional})")
+        return None
+    try:
+        res = signed_request("POST", "/api/v3/order",
+                             {"symbol": SYMBOL, "side": "SELL", "type": "MARKET", "quantity": f"{qty:.{qty_precision}f}"})
+        state['live_log'].append(f"[Sell] Market order placed: qty={qty:.4f} @ {price:.4f}")
+        return qty
+    except Exception as e:
+        state['live_log'].append(f"[Sell] Order failed: {e}")
+        return None
+
+# --- Backtest (slim version, with best MA scan) ---
+def grid_search_lengths(prices, times, min_len=MIN_FAST_LEN, max_len=MAX_SLOW_LEN):
+    best = None
+    best_metrics = (0.0, 0.0)
+    best_trades = 0
+    n = len(prices)
+    if n < max_len + 5:
+        max_len = max(10, min(max_len, n - 5))
+    for fast in range(min_len, max_len):
+        for slow in range(fast + 1, max_len + 1):
+            trades, winrate, pnl = backtest_for_lengths(prices, times, fast, slow)
+            if trades == 0: continue
+            score = (winrate, pnl)
+            if score > best_metrics:
+                best_metrics = score
+                best = (fast, slow)
+                best_trades = trades
+    if best is None:
+        best = (MIN_FAST_LEN, MAX_SLOW_LEN)
+        best_trades, wr, pnl = backtest_for_lengths(prices, times, *best)
+        best_metrics = (wr, pnl)
+    return best, {"trades": best_trades, "winrate": best_metrics[0], "pnl": best_metrics[1]}
+
+def backtest_for_lengths(prices, times, fast_len, slow_len):
+    n = len(prices)
+    if n < slow_len + 2:
+        return 0, 0.0, 0.0
+    ps = prefix_sums(prices)
+    state_ = "flat"
+    last_buy = None
     peak = None
     max_gain_pct = 0.0
     downtrend_started = False
-    tp_armed = {lvl: False for lvl in TP_LEVELS}
-    cross_down_count = 0
-
-    total_profit = 0.0
-    num_trades = 0
-    win_trades = 0
-
-    for idx, row in df.iterrows():
-        price = row['close']
-        ts = row['timestamp']
-
-        ema_bf = alpha_bf * price + (1 - alpha_bf) * ema_bf
-        ema_bs = alpha_bs * price + (1 - alpha_bs) * ema_bs
-        ema_sf = alpha_sf * price + (1 - alpha_sf) * ema_sf
-        ema_sm = alpha_sm * price + (1 - alpha_sm) * ema_sm
-        ema_ss = alpha_ss * price + (1 - alpha_ss) * ema_ss
-
-        buy_cross_up = ema_bf > ema_bs
-        buy_slow_trending_up = price > ema_bs
-        buy_signal = buy_cross_up and buy_slow_trending_up
-
-        sell_cross_down_mid = ema_sf < ema_sm
-        sell_cross_down_slow = ema_sf < ema_ss
-        sell_signal = sell_cross_down_mid or sell_cross_down_slow
-        cross_down = ema_sf < ema_ss
-
-        if not in_trade and buy_signal:
-            in_trade = True
-            entry_price = price
-            peak = price
-            tp_armed = {lvl: False for lvl in TP_LEVELS}
-            cross_down_count = 0
-            if plot_markers:
-                with conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO markers (time, position, color, shape, text) VALUES (?, ?, ?, ?, ?)",
-                        (int(ts.timestamp()), "below", "lime", "arrowUp", "BUY")
-                    )
-                    cursor.close()
-        elif in_trade:
-            peak = max(peak, price)
-            gross_gain = (price - entry_price) / entry_price * 100.0
-            for lvl in TP_LEVELS:
-                if not tp_armed[lvl] and gross_gain >= lvl + TP_ARM_BUFFER:
-                    tp_armed[lvl] = True
-            retrace_sell = any(tp_armed[lvl] and gross_gain <= lvl - TP_EXIT_BUFFER for lvl in TP_LEVELS)
-
-            if cross_down:
-                cross_down_count += 1
+    level_armed = {lvl: False for lvl in TP_LEVELS}
+    wins, total, total_pnl = 0, 0, 0.0
+    ma_fast = [None]*(fast_len-1) + [mean_at(ps, i, fast_len) for i in range(fast_len-1, n)]
+    ma_slow = [None]*(slow_len-1) + [mean_at(ps, i, slow_len) for i in range(slow_len-1, n)]
+    buy_confirm = 0
+    for i in range(slow_len, n):
+        if i - 1 < slow_len - 1: continue
+        slow_prev = ma_slow[i-1]; slow_curr = ma_slow[i]
+        fast_prev = ma_fast[i-1] if i-1 >= fast_len-1 else None
+        fast_curr = ma_fast[i] if i >= fast_len-1 else None
+        close_prev = prices[i-1]; close_curr = prices[i]
+        buy_signal = False
+        if state_ == "flat":
+            if close_prev <= slow_prev and close_curr > slow_curr and fast_prev is not None and fast_curr is not None and fast_curr > fast_prev:
+                buy_signal = True
+            if buy_signal:
+                buy_confirm += 1
             else:
-                cross_down_count = 0
-
-            if sell_signal or retrace_sell or cross_down_count >= SELL_CROSS_CONFIRM_TICKS:
-                profit = price - entry_price
-                total_profit += profit
-                num_trades += 1
-                if profit > 0:
-                    win_trades += 1
-                with conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO trades (entry_time, entry, exit_time, exit, profit) VALUES (?, ?, ?, ?, ?)",
-                        (str(ts), entry_price, str(ts), price, profit)
-                    )
-                    if plot_markers:
-                        cursor.execute(
-                            "INSERT INTO markers (time, position, color, shape, text) VALUES (?, ?, ?, ?, ?)",
-                            (int(ts.timestamp()), "above", "red", "arrowDown", "SELL")
-                        )
-                    cursor.close()
-                in_trade = False
+                buy_confirm = 0
+            if buy_confirm >= MIN_BUY_CONFIRM_TICKS:
+                state_ = "long"
+                last_buy = close_curr
+                peak = close_curr
+                max_gain_pct = 0.0
+                downtrend_started = False
+                level_armed = {lvl: False for lvl in TP_LEVELS}
+                buy_confirm = 0
+                continue
+        if state_ == "long" and last_buy is not None:
+            if close_curr > (peak or close_curr): peak = close_curr
+            gross_gain = (close_curr - last_buy) / last_buy * 100.0
+            if gross_gain > max_gain_pct: max_gain_pct = gross_gain
+            if close_curr < peak: downtrend_started = True
+            for lvl in TP_LEVELS:
+                if not level_armed[lvl] and max_gain_pct >= (lvl + TP_ARM_BUFFER):
+                    level_armed[lvl] = True
+            sell_cross = False
+            if fast_prev is not None and fast_curr is not None and close_prev >= fast_prev and close_curr < fast_curr:
+                sell_cross = True
+            if close_prev >= slow_prev and close_curr < slow_curr:
+                sell_cross = True
+            sell_retrace = False
+            if downtrend_started:
+                for lvl in TP_LEVELS:
+                    if level_armed[lvl] and gross_gain <= (lvl - TP_EXIT_BUFFER):
+                        sell_retrace = True; break
+            if sell_cross or sell_retrace:
+                pnl = (close_curr - last_buy) / last_buy * 100.0
+                total_pnl += pnl
+                total += 1
+                if pnl > 0: wins += 1
+                state_ = "flat"
+                last_buy = None
                 peak = None
                 max_gain_pct = 0.0
                 downtrend_started = False
-                tp_armed = {lvl: False for lvl in TP_LEVELS}
-                cross_down_count = 0
+                level_armed = {lvl: False for lvl in TP_LEVELS}
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+    return total, winrate, total_pnl
 
-    win_rate = win_trades / num_trades if num_trades > 0 else 0
-    return {
-        'buy_fast': buy_fast,
-        'buy_slow': buy_slow,
-        'sell_fast': sell_fast,
-        'sell_mid': sell_mid,
-        'sell_slow': sell_slow,
-        'total_profit': total_profit,
-        'num_trades': num_trades,
-        'win_rate': win_rate
-    }
+# --- TickStrategy class (live, with dashboard sync) ---
+class TickStrategy(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.ws = None
+        self._stop_event = threading.Event()
+        self.live_prices = []
+        self.live_times = []
+        self.fast_ma = []
+        self.slow_ma = []
+        self.state = "flat"
+        self.last_buy_price = None
+        self.peak_since_buy = None
+        self.max_gain_pct = 0.0
+        self.downtrend_started = False
+        self.level_armed = {lvl: False for lvl in TP_LEVELS}
+        self.buy_confirm = 0
+        self.buy_in_progress = False
+        self.last_tick_proc_time = 0
+        self.markers = []
+        self.trades = []
 
-# =============== RANDOMISED SEARCH (NEW) ===============
-def random_search(df, max_tests=60):
-    state["backtest_log"].clear()
-    best_result = None
-    best_combo = None
-    tested = set()
-    for idx in range(max_tests):
-        buy_fast = random.randint(BUY_FAST_RANGE[0], BUY_FAST_RANGE[1])
-        buy_slow = random.randint(BUY_SLOW_RANGE[0], BUY_SLOW_RANGE[1])
-        if buy_fast >= buy_slow:
-            buy_fast, buy_slow = sorted([buy_fast, buy_slow])
+    def stop(self):
+        self._stop_event.set()
+        try:
+            if self.ws: self.ws.close()
+        except: pass
 
-        sell_fast = random.randint(SELL_FAST_RANGE[0], SELL_FAST_RANGE[1])
-        sell_mid = random.randint(SELL_MID_RANGE[0], SELL_MID_RANGE[1])
-        sell_slow = random.randint(SELL_SLOW_RANGE[0], SELL_SLOW_RANGE[1])
-        arr = sorted([sell_fast, sell_mid, sell_slow])
-        sell_fast, sell_mid, sell_slow = arr[0], arr[1], arr[2]
-        combo_key = (buy_fast, buy_slow, sell_fast, sell_mid, sell_slow)
-        if combo_key in tested:
-            continue
-        tested.add(combo_key)
+    def run(self):
+        candles = fetch_klines_recent(SYMBOL, INTERVAL, CHART_HIST_LIMIT)
+        prices, times = to_price_time(candles)
+        self.live_prices = prices[-CHART_HIST_LIMIT:].copy()
+        self.live_times = times[-CHART_HIST_LIMIT:].copy()
+        self.fast_ma = calc_ma_series(self.live_prices, MIN_FAST_LEN)
+        self.slow_ma = calc_ma_series(self.live_prices, MAX_SLOW_LEN)
+        while not self._stop_event.is_set():
+            try:
+                self._run_ws()
+            except Exception as e:
+                state['live_log'].append(f"[TickStrategy] Exception: {e}")
+                traceback.print_exc()
+                time.sleep(WS_RECONNECT_SECS)
 
-        result = backtest(df, buy_fast, buy_slow, sell_fast, sell_mid, sell_slow)
-        state["backtest_progress"] = idx + 1
-        state["backtest_total"] = max_tests
-        state["backtest_log"].append(
-            f"Test {idx+1}/{max_tests}: BF={buy_fast} BS={buy_slow} | SF={sell_fast} SM={sell_mid} SS={sell_slow} | "
-            f"Profit={result['total_profit']:.2f} | Trades={result['num_trades']}"
+    def _run_ws(self):
+        ws_url = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@trade"
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            on_message=self._on_message,
+            on_close=lambda ws, *a: state['live_log'].append("[TickStrategy] WebSocket closed."),
+            on_error=lambda ws, err: state['live_log'].append(f"[TickStrategy] WebSocket error: {err}")
         )
-        if best_result is None or result['total_profit'] > best_result['total_profit']:
-            best_result = result
-            best_combo = (buy_fast, buy_slow, sell_fast, sell_mid, sell_slow)
+        self.ws.run_forever()
 
-    return best_combo, best_result
+    def _update_ma(self):
+        self.fast_ma = calc_ma_series(self.live_prices, MIN_FAST_LEN)
+        self.slow_ma = calc_ma_series(self.live_prices, MAX_SLOW_LEN)
+        if len(self.fast_ma) > CHART_HIST_LIMIT:
+            self.fast_ma = self.fast_ma[-CHART_HIST_LIMIT:]
+        if len(self.slow_ma) > CHART_HIST_LIMIT:
+            self.slow_ma = self.slow_ma[-CHART_HIST_LIMIT:]
 
-# ================= CHART DATA LOADER =================
-def load_chart_data():
-    try:
-        exchange = ccxt.binance()
-        df = fetch_ohlcv(SYMBOL, TIMEFRAME, DATA_LIMIT, exchange)
-        prices = [{"time": int(ts.timestamp()), "value": close} for ts, close in zip(df['timestamp'], df['close'])]
+    def _on_message(self, ws, message):
+        try:
+            msg = json.loads(message)
+            price = float(msg['p'])
+            ts = int(msg['T']) // 1000
 
-        # Only compute EMAs for best combination
-        if state.get("ema_settings"):
-            settings = state["ema_settings"]
-        else:
-            settings = [BUY_MA1_LEN, BUY_MA2_LEN, SELL_MA1_LEN, SELL_MA2_LEN, SELL_MA3_LEN]
+            if ts < self.last_tick_proc_time + TICK_THROTTLE_SECS:
+                return
+            self.last_tick_proc_time = ts
 
-        ema_lines = [
-            ema(df['close'], settings[0]),
-            ema(df['close'], settings[1]),
-            ema(df['close'], settings[2]),
-            ema(df['close'], settings[3]),
-            ema(df['close'], settings[4]),
-        ]
-        emas = []
-        for line in ema_lines:
-            emas.append([{"time": int(ts.timestamp()), "value": float(v) if not pd.isna(v) else None}
-                         for ts, v in zip(df['timestamp'], line)])
+            if self.live_times and ts <= self.live_times[-1]:
+                return
+            self.live_prices.append(price)
+            self.live_times.append(ts)
+            if len(self.live_prices) > CHART_HIST_LIMIT:
+                self.live_prices.pop(0)
+                self.live_times.pop(0)
+            self._update_ma()
+            idx = len(self.live_prices) - 1
+            fast = self.fast_ma[idx]
+            slow = self.slow_ma[idx]
+            fast_prev = self.fast_ma[idx-1] if idx > 0 else None
+            slow_prev = self.slow_ma[idx-1] if idx > 0 else None
+            price_prev = self.live_prices[idx-1] if idx > 0 else None
 
-        # Load markers from DB
-        c.execute("SELECT time, position, color, shape, text FROM markers ORDER BY time ASC")
-        markers = [{"time": row[0], "position": row[1], "color": row[2], "shape": row[3], "text": row[4]} for row in c.fetchall()]
+            # === BUY LOGIC ===
+            if self.state == "flat":
+                buy_signal = False
+                if price_prev is not None and fast_prev is not None and slow_prev is not None:
+                    if price_prev <= slow_prev and price > slow and fast > fast_prev:
+                        buy_signal = True
+                if buy_signal:
+                    self.buy_confirm += 1
+                else:
+                    self.buy_confirm = 0
+                if self.buy_confirm >= MIN_BUY_CONFIRM_TICKS and not self.buy_in_progress:
+                    state['live_log'].append(f"[TickStrategy] BUY confirmed at {price:.6f} (time={ts})")
+                    self._handle_buy(price, ts)
+                    self.buy_in_progress = True
+                    self.buy_confirm = 0
 
-        return prices, emas, markers
-    except Exception as e:
-        return [], [[{}],[{}],[{}],[{}],[{}]], []
-# =================== FLASK ROUTES ===================
+            # === SELL LOGIC ===
+            if self.state == "long" and self.last_buy_price is not None:
+                if price > (self.peak_since_buy or price): self.peak_since_buy = price
+                gross_gain = (price - self.last_buy_price) / self.last_buy_price * 100.0
+                if gross_gain > self.max_gain_pct: self.max_gain_pct = gross_gain
+                if price < self.peak_since_buy: self.downtrend_started = True
+                for lvl in TP_LEVELS:
+                    if not self.level_armed[lvl] and self.max_gain_pct >= (lvl + TP_ARM_BUFFER):
+                        self.level_armed[lvl] = True
+                sell_cross = False
+                if fast_prev is not None and fast is not None and price_prev is not None:
+                    if price_prev >= fast_prev and price < fast:
+                        sell_cross = True
+                if slow_prev is not None and slow is not None and price_prev is not None:
+                    if price_prev >= slow_prev and price < slow:
+                        sell_cross = True
+                sell_retrace = False
+                if self.downtrend_started:
+                    for lvl in TP_LEVELS:
+                        if self.level_armed[lvl] and gross_gain <= (lvl - TP_EXIT_BUFFER):
+                            sell_retrace = True; break
+                if sell_cross or sell_retrace:
+                    state['live_log'].append(f"[TickStrategy] SELL confirmed at {price:.6f} (time={ts})")
+                    self._handle_sell(price, ts)
+        except Exception as e:
+            state['live_log'].append(f"[TickStrategy] on_message error: {e}")
+            traceback.print_exc()
+
+    def _handle_buy(self, price, ts):
+        try:
+            step_size, min_qty, min_notional, qty_precision = get_symbol_filters(SYMBOL)
+            _, quote_free = get_balances()
+            qty = buy(quote_free, price, FEE_RATE_TRADE, step_size, min_qty, min_notional, qty_precision)
+            if qty:
+                self.state = "long"
+                self.last_buy_price = price
+                self.peak_since_buy = price
+                self.max_gain_pct = 0.0
+                self.downtrend_started = False
+                self.level_armed = {lvl: False for lvl in TP_LEVELS}
+                state['trades'].append(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}] BUY @ {price:.4f} qty={qty:.4f}")
+                self.markers.append({
+                    "time": ts,
+                    "position": "below",
+                    "color": "lime",
+                    "shape": "arrowUp",
+                    "text": f"BUY {price:.4f}"
+                })
+                if len(self.markers) > CHART_HIST_LIMIT:
+                    self.markers = self.markers[-CHART_HIST_LIMIT:]
+            self.buy_in_progress = False
+        except Exception as e:
+            state['live_log'].append(f"[TickStrategy] BUY EXCEPTION: {e}")
+            traceback.print_exc()
+            self.buy_in_progress = False
+
+    def _handle_sell(self, price, ts):
+        try:
+            step_size, min_qty, min_notional, qty_precision = get_symbol_filters(SYMBOL)
+            base_free, _ = get_balances()
+            qty = sell(base_free, price, step_size, min_qty, min_notional, qty_precision)
+            if qty:
+                state['trades'].append(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}] SELL @ {price:.4f} qty={qty:.4f}")
+                self.state = "flat"
+                self.last_buy_price = None
+                self.peak_since_buy = None
+                self.max_gain_pct = 0.0
+                self.downtrend_started = False
+                self.level_armed = {lvl: False for lvl in TP_LEVELS}
+                self.buy_confirm = 0
+                self.buy_in_progress = False
+                self.markers.append({
+                    "time": ts,
+                    "position": "above",
+                    "color": "red",
+                    "shape": "arrowDown",
+                    "text": f"SELL {price:.4f}"
+                })
+                if len(self.markers) > CHART_HIST_LIMIT:
+                    self.markers = self.markers[-CHART_HIST_LIMIT:]
+        except Exception as e:
+            state['live_log'].append(f"[TickStrategy] SELL EXCEPTION: {e}")
+            traceback.print_exc()
+# =================== FLASK ROUTES AND ENDPOINTS ===================
+
 @app.route("/")
 def index():
     return render_template_string(
         HTML,
-        backtest_running=state["backtest_running"],
+        symbol=SYMBOL,
         live_running=state["live_running"]
     )
 
 @app.route("/chartdata")
 def chartdata():
-    prices, emas, markers = load_chart_data()
-    return jsonify({"prices": prices, "emas": emas, "markers": markers})
+    # Get latest candles, mas, and markers for chart
+    try:
+        candles = fetch_klines_recent(SYMBOL, INTERVAL, CHART_HIST_LIMIT)
+        prices, times = to_price_time(candles)
+        price_line = [{"time": t, "value": p} for t, p in zip(times, prices)]
+
+        fast_ma = calc_ma_series(prices, MIN_FAST_LEN)
+        fast_line = [
+            {"time": times[i], "value": v} for i, v in enumerate(fast_ma) if v is not None
+        ]
+        slow_ma = calc_ma_series(prices, MAX_SLOW_LEN)
+        slow_line = [
+            {"time": times[i], "value": v} for i, v in enumerate(slow_ma) if v is not None
+        ]
+        # Live markers (from running strat)
+        strat = globals().get("strat_thread", None)
+        markers = strat.markers if strat and hasattr(strat, "markers") else []
+        return jsonify({
+            "prices": price_line,
+            "fast": fast_line,
+            "slow": slow_line,
+            "markers": markers,
+        })
+    except Exception as e:
+        return jsonify({
+            "prices": [],
+            "fast": [],
+            "slow": [],
+            "markers": [],
+            "error": str(e)
+        })
 
 @app.route("/status")
 def status():
-    def fmt_trades():
-        c.execute("SELECT entry_time, entry, exit_time, exit, profit FROM trades ORDER BY id DESC LIMIT 8")
-        rows = c.fetchall()
-        if not rows:
-            return "None"
-        lines = [f"[Entry] {r[0]} @ {r[1]:.3f} → [Exit] {r[2]} @ {r[3]:.3f} | P/L: {r[4]:.3f}" for r in rows]
-        return "\n".join(lines)
+    # Web UI: Show all key stats/logs
+    best = state.get("best_params")
+    metrics = state.get("backtest_metrics")
+    strat = globals().get("strat_thread", None)
 
-    best = state.get("best_result", None)
     ema_str = ""
     best_str = ""
+    bt_metrics = ""
     if best:
-        ema_str = f"Buy: <b>{best.get('buy_fast','')} / {best.get('buy_slow','')}</b> | " \
-                  f"Sell: <b>{best.get('sell_fast','')} / {best.get('sell_mid','')} / {best.get('sell_slow','')}</b>"
-        best_str = f"Profit: <b>{best.get('total_profit',0):.2f}</b> | Trades: {best.get('num_trades',0)} | Win: {best.get('win_rate',0):.2%}"
-
+        ema_str = f"Fast: <b>{best[0]}</b> / Slow: <b>{best[1]}</b>"
+    if metrics:
+        best_str = f"Trades: {metrics.get('trades',0)} | Win: {metrics.get('winrate',0):.2f}% | PnL: {metrics.get('pnl',0):.2f}%"
+        bt_metrics = f"<b>Backtest PnL:</b> {metrics.get('pnl',0):.2f}% &nbsp; <b>Winrate:</b> {metrics.get('winrate',0):.2f}% &nbsp; <b>Trades:</b> {metrics.get('trades',0)}"
+    trades_str = "<br>".join(state.get("trades", [])[-8:]) if state.get("trades") else "None"
     return jsonify({
-        "backtest_status": ("RUNNING" if state["backtest_running"] else "IDLE") + f" ({state['backtest_progress']}/{state['backtest_total']})",
-        "backtest_log": state["backtest_log"][-16:],
-        "best_result": best_str,
-        "ema_settings": ema_str,
         "live_status": "RUNNING" if state["live_running"] else "IDLE",
         "live_log": state["live_log"][-16:],
-        "trades": fmt_trades(),
+        "ema_settings": ema_str,
+        "best_result": best_str,
+        "backtest_metrics": bt_metrics,
+        "trades": trades_str,
     })
 
-# =================== START BACKTEST ===================
 @app.route("/start_backtest", methods=["POST"])
 def start_backtest():
-    if state["backtest_running"]:
-        return redirect(url_for('index'))
-
-    try:
-        num_tests = int(request.form.get("num_tests", 60))
-        num_tests = max(1, min(num_tests, MAX_TESTS))
-    except Exception:
-        num_tests = 60
-
     def worker():
         try:
-            state["backtest_running"] = True
-            state["backtest_progress"] = 0
-            state["backtest_total"] = 0
-            state["backtest_log"].clear()
-
-            # Clear DB for new backtest (using global cursor: main thread)
-            c.execute("DELETE FROM trades")
-            c.execute("DELETE FROM markers")
-            conn.commit()
-
-            exchange = ccxt.binance()
-            df = fetch_ohlcv(SYMBOL, TIMEFRAME, DATA_LIMIT, exchange)
-            best_combo, best_result = random_search(df, num_tests)
-
-            if best_result is None:
-                state["backtest_log"].append("[ERROR] No valid MA parameter combinations!")
-                state["backtest_running"] = False
-                return
-
-            state["best_result"] = best_result
-            state["ema_settings"] = [best_combo[0], best_combo[1], best_combo[2], best_combo[3], best_combo[4]]
-
+            state["live_log"].append("[Backtest] Starting...")
+            now_ms = int(time.time() * 1000)
+            start_ms = now_ms - BACKTEST_HOURS * 60 * 60 * 1000
+            candles = fetch_klines_recent(SYMBOL, INTERVAL, CHART_HIST_LIMIT)
+            prices, times = to_price_time(candles)
+            best, metrics = grid_search_lengths(prices, times, MIN_FAST_LEN, MAX_SLOW_LEN)
+            state["best_params"] = best
+            state["backtest_metrics"] = metrics
+            state["live_log"].append(f"[Backtest] DONE. Best: fast={best[0]}, slow={best[1]} | PnL={metrics['pnl']:.2f}% | Win={metrics['winrate']:.2f}%")
         except Exception as ex:
-            state["backtest_log"].append(f"[ERROR] {ex}")
-        finally:
-            state["backtest_running"] = False
-
+            state["live_log"].append(f"[Backtest] ERROR: {ex}")
+            traceback.print_exc()
     threading.Thread(target=worker, daemon=True).start()
     return redirect(url_for('index'))
 
-# =================== LIVE TRADER ===================
-def run_live_trader():
-    state["live_running"] = True
-    state["stop_signal"] = False
-    state["live_log"].append("[Live] Trader started.")
-
-    ema_params = state.get("ema_settings") or [BUY_MA1_LEN, BUY_MA2_LEN, SELL_MA1_LEN, SELL_MA2_LEN, SELL_MA3_LEN]
-    buy_fast, buy_slow, sell_fast, sell_mid, sell_slow = ema_params
-
-    try:
-        exchange = ccxt.binance({'apiKey': API_KEY, 'secret': API_SECRET, 'enableRateLimit': True})
-        in_trade = False
-        entry_price = None
-        peak = None
-        max_gain_pct = 0.0
-        downtrend_started = False
-        tp_armed = {lvl: False for lvl in TP_LEVELS}
-        cross_down_count = 0
-
-        while state["live_running"] and not state["stop_signal"]:
-            df = fetch_ohlcv(SYMBOL, TIMEFRAME, DATA_LIMIT, exchange)
-            i = len(df) - 1
-            if i < 2:
-                time.sleep(60)
-                continue
-
-            price = df['close'][i]
-            ts = df['timestamp'][i]
-
-            # ENTRY LOGIC
-            ema_buy_fast = ema(df['close'], buy_fast)
-            ema_buy_slow = ema(df['close'], buy_slow)
-            buy_cross_up = (ema_buy_fast[i-1] < ema_buy_slow[i-1]) and (ema_buy_fast[i] > ema_buy_slow[i])
-            buy_slow_trending_up = ema_buy_slow[i] > ema_buy_slow[i-1]
-            buy_signal = buy_cross_up and buy_slow_trending_up
-
-            # EXIT LOGIC
-            ema_sell_fast = ema(df['close'], sell_fast)
-            ema_sell_mid = ema(df['close'], sell_mid)
-            ema_sell_slow = ema(df['close'], sell_slow)
-            sell_cross_down_mid = (ema_sell_fast[i-1] > ema_sell_mid[i-1]) and (ema_sell_fast[i] < ema_sell_mid[i])
-            sell_cross_down_slow = (ema_sell_fast[i-1] > ema_sell_slow[i-1]) and (ema_sell_fast[i] < ema_sell_slow[i])
-            sell_signal = sell_cross_down_mid or sell_cross_down_slow
-            cross_down = ema_sell_fast[i] < ema_sell_slow[i]
-
-            # --- TRADE MANAGEMENT ---
-            if not in_trade and buy_signal:
-                in_trade = True
-                entry_price = price
-                peak = price
-                max_gain_pct = 0.0
-                downtrend_started = False
-                tp_armed = {lvl: False for lvl in TP_LEVELS}
-                cross_down_count = 0
-                state["live_log"].append(f"[{ts}] BUY @ {price:.3f}")
-
-            elif in_trade:
-                if price > (peak or price):
-                    peak = price
-                gross_gain = (price - entry_price)/entry_price*100.0
-                if gross_gain > max_gain_pct:
-                    max_gain_pct = gross_gain
-                if price < peak:
-                    downtrend_started = True
-
-                # TP arming
-                for lvl in TP_LEVELS:
-                    if not tp_armed[lvl] and max_gain_pct >= (lvl + TP_ARM_BUFFER):
-                        tp_armed[lvl] = True
-
-                retrace_sell = False
-                if downtrend_started:
-                    for lvl in TP_LEVELS:
-                        if tp_armed[lvl] and gross_gain <= (lvl - TP_EXIT_BUFFER):
-                            retrace_sell = True
-                            break
-
-                if cross_down:
-                    cross_down_count += 1
-                else:
-                    cross_down_count = 0
-
-                if retrace_sell or (sell_signal and any(tp_armed.values())) or (cross_down_count >= SELL_CROSS_CONFIRM_TICKS):
-                    profit = price - entry_price
-                    state["live_log"].append(f"[{ts}] SELL @ {price:.3f} PnL: {profit:.3f}")
-                    in_trade = False
-                    peak = None
-                    max_gain_pct = 0.0
-                    downtrend_started = False
-                    tp_armed = {lvl: False for lvl in TP_LEVELS}
-                    cross_down_count = 0
-
-            # Keep last 100 logs
-            state["live_log"] = state["live_log"][-100:]
-            time.sleep(60)  # Wait before next candle
-
-    except Exception as ex:
-        state["live_log"].append(f"[ERROR] {ex}")
-    finally:
-        state["live_log"].append("[Live] Trader stopped.")
-        state["live_running"] = False
-
-# =================== START/STOP LIVE ===================
 @app.route("/start_live", methods=["POST"])
 def start_live():
     if not state["live_running"]:
-        threading.Thread(target=run_live_trader, daemon=True).start()
+        state["live_running"] = True
+        # Start/restart TickStrategy background thread
+        global strat_thread
+        try:
+            if "strat_thread" in globals() and strat_thread.is_alive():
+                strat_thread.stop()
+                time.sleep(2)
+        except Exception: pass
+        strat_thread = TickStrategy()
+        strat_thread.start()
+        state["live_log"].append("[Live] Trader started.")
     return redirect(url_for('index'))
 
 @app.route("/stop_live", methods=["POST"])
 def stop_live():
     state["stop_signal"] = True
-    state["live_log"].append("[Live] Stopping trader...")
+    state["live_running"] = False
+    state["live_log"].append("[Live] Trader stopping...")
+    try:
+        global strat_thread
+        if "strat_thread" in globals() and strat_thread.is_alive():
+            strat_thread.stop()
+    except Exception: pass
     return redirect(url_for('index'))
 
-# =================== RUN APP ===================
+# ================ RUN FLASK APP ================
 if __name__ == "__main__":
-    print("Starting EMA Cross web dashboard at http://127.0.0.1:5000 ...")
-    app.run(debug=False, port=5000)
+    # Run any auto-backtest for best params at startup
+    try:
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - BACKTEST_HOURS * 60 * 60 * 1000
+        candles = fetch_klines_recent(SYMBOL, INTERVAL, CHART_HIST_LIMIT)
+        prices, times = to_price_time(candles)
+        best, metrics = grid_search_lengths(prices, times, MIN_FAST_LEN, MAX_SLOW_LEN)
+        state["best_params"] = best
+        state["backtest_metrics"] = metrics
+        print("[AUTO BACKTEST] Best fast/slow:", best)
+        print("[AUTO BACKTEST] Trades:", metrics['trades'], "Winrate:", metrics['winrate'], "PnL:", metrics['pnl'])
+    except Exception as ex:
+        print("[AUTO BACKTEST] EXCEPTION:", ex)
+        traceback.print_exc()
+    # Start web server
+    print(f"Dashboard running at http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)
